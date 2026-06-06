@@ -1,0 +1,317 @@
+import os
+import time
+import json
+import queue
+import logging
+import platform
+import subprocess
+import ctypes
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+import sounddevice as sd
+from vosk import Model, KaldiRecognizer
+import pygame
+
+# -------------------- CONFIG --------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH_RU = os.path.join(BASE_DIR, "vosk-model-small-ru-0.22")
+WAKE_KEY = "right shift"  # wake/activate key
+COMMAND_TIMEOUT = 10       # seconds
+SAMPLE_RATE = 16000
+BLOCKSIZE = 4000
+
+# Если WAV файлов нет/не найден — TTS не делаем (чтобы не усложнять зависимости).
+# Здесь просто молчит/пропускает воспроизведение.
+
+def _wav(name: str) -> str:
+    return os.path.join(BASE_DIR, name)
+
+SOUNDS = {
+    "greeting": _wav("Да, сэр.wav"),
+    "greeting2": _wav("Мы подключены и готовы.wav"),
+    "shutdown": _wav("Отключаю питание.wav"),
+    "restart": _wav("Да, сэр.wav"),
+    "lock": _wav("Да, сэр.wav"),
+    "minimize_all": _wav("Всегда к вашим услугам сэр.wav"),
+    "bin": _wav("Как пожелаете .wav"),
+    "camera": _wav("Есть.wav"),
+    "exit": _wav("Отключаю питание.wav"),
+    "search": _wav("Запрос выполнен, сэр.wav"),
+    "action_restart_explorer": _wav("Всегда к вашим услугам сэр.wav"),
+}
+
+# -------------------- LOGGING --------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# -------------------- AUDIO (WAV) --------------------
+pygame.mixer.init()
+_executor = ThreadPoolExecutor(max_workers=4)
+
+_sound_cache = {}
+
+def play_sound(path: str | None):
+    if not path:
+        return
+    try:
+        if path not in _sound_cache:
+            if os.path.exists(path):
+                _sound_cache[path] = pygame.mixer.Sound(path)
+            else:
+                return
+        _sound_cache[path].play()
+    except Exception as e:
+        logging.debug(f"play_sound error: {e}")
+
+
+def safe_submit(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        logging.error(f"Ошибка в {getattr(fn, '__name__', str(fn))}: {e}")
+        return None
+
+
+# -------------------- COMMANDS --------------------
+
+def action_exit():
+    logging.info("🛑 Выключение помощника...")
+    _executor.submit(play_sound, SOUNDS.get("shutdown"))
+    time.sleep(1)
+    os._exit(0)
+
+
+def action_shutdown():
+    os.system("shutdown /s /t 1")
+
+
+def action_restart():
+    os.system("shutdown /r /t 1")
+
+
+def action_lock():
+    if platform.system() == "Windows":
+        ctypes.windll.user32.LockWorkStation()
+
+
+def action_minimize_all_windows():
+    # Win+Down (минимизировать)
+    if platform.system() != "Windows":
+        return
+    user32 = ctypes.WinDLL("user32")
+    VK_LWIN = 0x5B
+    VK_D = 0x44
+    KEYEVENTF_KEYDOWN = 0x0000
+    KEYEVENTF_KEYUP = 0x0002
+    user32.keybd_event(ctypes.c_ubyte(VK_LWIN), 0, KEYEVENTF_KEYDOWN, 0)
+    user32.keybd_event(ctypes.c_ubyte(VK_D), 0, KEYEVENTF_KEYDOWN, 0)
+    time.sleep(0.05)
+    user32.keybd_event(ctypes.c_ubyte(VK_D), 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(ctypes.c_ubyte(VK_LWIN), 0, KEYEVENTF_KEYUP, 0)
+
+
+def action_empty_recycle_bin():
+    # Win SHEmptyRecycleBinW
+    if platform.system() != "Windows":
+        return
+    SHEmptyRecycleBin = ctypes.windll.shell32.SHEmptyRecycleBinW
+    flags = 0x00000001 | 0x00000002 | 0x00000004
+    SHEmptyRecycleBin(None, None, flags)
+
+
+def open_app(app_path: str):
+    try:
+        if platform.system() == "Windows":
+            os.startfile(app_path)
+    except Exception as e:
+        logging.error(f"Ошибка при открытии {app_path}: {e}")
+
+
+def action_open_camera():
+    # пытаемся открыть OBS Studio и камеру. Если не нужно — удалите.
+    try:
+        open_app(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\OBS Studio.lnk")
+    except Exception:
+        pass
+    try:
+        subprocess.run(["start", "microsoft.windows.camera:"], shell=True)
+    except Exception as e:
+        logging.error(f"Ошибка при запуске камеры: {e}")
+
+
+def action_search(query: str):
+    # Google search
+    q = (query or "").strip()
+    if not q:
+        return
+    encoded_query = urllib.parse.quote(q)
+    url = f"https://www.google.com/search?q={encoded_query}"
+    import webbrowser
+    webbrowser.open(url)
+
+
+def action_restart_explorer():
+    try:
+        subprocess.run("taskkill /f /im explorer.exe", shell=True)
+        time.sleep(1)
+        subprocess.Popen("explorer.exe", shell=True)
+    except Exception as e:
+        logging.error(f"Ошибка при перезапуске проводника: {e}")
+
+
+def greeting():
+    return
+
+
+COMMANDS = {
+    "greeting": {
+        "keywords": ["джарвис", "эй джарвис", "ассистент", "jarvis", "привет джарвис"],
+        "action": greeting,
+        "sound": SOUNDS.get("greeting"),
+    },
+    "shutdown": {
+        "keywords": ["выключи компьютер", "отключи компьютер", "заверши работу", "питание выкл"],
+        "action": action_shutdown,
+        "sound": SOUNDS.get("shutdown"),
+    },
+    "restart": {
+        "keywords": ["перезагрузи компьютер", "перезапусти компьютер", "рестарт", "перезапуск"],
+        "action": action_restart,
+        "sound": SOUNDS.get("restart"),
+    },
+    "lock": {
+        "keywords": ["заблокируй компьютер", "блокировка", "заблокировать пк", "экран блок"],
+        "action": action_lock,
+        "sound": SOUNDS.get("lock"),
+    },
+    "minimize_all": {
+        "keywords": ["сверни все окна", "сверни всё", "показать рабочий стол", "покажи стол"],
+        "action": action_minimize_all_windows,
+        "sound": SOUNDS.get("minimize_all"),
+    },
+    "bin": {
+        "keywords": ["очисти корзину", "очисти мусор", "удали мусор", "пустая корзина"],
+        "action": action_empty_recycle_bin,
+        "sound": SOUNDS.get("bin"),
+    },
+    "camera": {
+        "keywords": ["запусти камеру", "открой камеру", "включи камеру", "камера", "вебкамера"],
+        "action": action_open_camera,
+        "sound": SOUNDS.get("camera"),
+    },
+    "exit": {
+        "keywords": ["джарвис выключись", "джарвис отключись"],
+        "action": action_exit,
+        "sound": SOUNDS.get("exit"),
+    },
+    "search": {
+        "keywords": ["поиск", "найди", "найди в гугл", "поиск в интернете"],
+        "action": action_search,
+        "sound": SOUNDS.get("search"),
+    },
+    "action_restart_explorer": {
+        "keywords": ["перезагрузи проводник", "перезапусти проводник", "проводник"],
+        "action": action_restart_explorer,
+        "sound": SOUNDS.get("action_restart_explorer"),
+    },
+}
+
+
+def recognize_command(text: str):
+    t = (text or "").strip().lower()
+    if not t:
+        return None, None
+
+    # простое совпадение по ключевым словам (быстрее и надежнее для Vosk кратких фраз)
+    for cmd_key, command in COMMANDS.items():
+        for kw in command["keywords"]:
+            if kw in t:
+                return cmd_key, kw
+    return None, None
+
+
+def listen_forever():
+    if not os.path.isdir(MODEL_PATH_RU):
+        raise FileNotFoundError(f"Vosk model not found: {MODEL_PATH_RU}")
+
+    logging.info("Загрузка Vosk модели...")
+    model = Model(MODEL_PATH_RU)
+    recognizer = KaldiRecognizer(model, SAMPLE_RATE)
+
+    q = queue.Queue()
+
+    def callback(indata, frames, time_info, status):
+        if status and "overflow" in str(status).lower():
+            logging.warning("audio overflow")
+        q.put(bytes(indata))
+
+    while True:
+        logging.info("Ожидание нажатия WAKE_KEY...")
+        try:
+            import keyboard
+            keyboard.wait(WAKE_KEY)
+        except Exception as e:
+            logging.error(f"keyboard.wait error: {e}")
+            time.sleep(1)
+            continue
+
+        logging.info("🟢 Активирован. Слушаю вас...")
+        _executor.submit(play_sound, SOUNDS.get("greeting"))
+
+        active_until = time.time() + COMMAND_TIMEOUT
+        try:
+            with sd.RawInputStream(
+                samplerate=SAMPLE_RATE,
+                blocksize=BLOCKSIZE,
+                dtype="int16",
+                channels=1,
+                callback=callback,
+            ):
+                while time.time() < active_until:
+                    try:
+                        data = q.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+
+                    if recognizer.AcceptWaveform(data):
+                        result = json.loads(recognizer.Result())
+                        text = (result.get("text") or "").strip().lower()
+                        if not text:
+                            continue
+
+                        logging.info(f"🗣 Услышал: {text}")
+                        cmd_key, keyword = recognize_command(text)
+                        if not cmd_key:
+                            logging.warning("Команда не распознана")
+                            continue
+
+                        command = COMMANDS[cmd_key]
+                        if command["action"] is action_search:
+                            # убираем ключевое слово поиска
+                            query = text.replace(keyword, "").replace("найди", "").replace("поиск", "").strip()
+                            _executor.submit(safe_submit, command["action"], query)
+                        else:
+                            _executor.submit(safe_submit, command["action"])
+
+                        _executor.submit(play_sound, command["sound"])
+                        active_until = time.time() + COMMAND_TIMEOUT
+
+                        # "exit" завершает через action_exit
+                        if cmd_key == "exit":
+                            return
+
+                        while not q.empty():
+                            q.get()
+
+        except Exception as e:
+            logging.error(f"Ошибка аудиопотока: {e}")
+
+        logging.info("💤 Время ожидания истекло")
+        time.sleep(0.3)
+
+
+if __name__ == "__main__":
+    play_sound(SOUNDS.get("greeting2"))
+    time.sleep(1)
+    listen_forever()
+
